@@ -1,0 +1,131 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import urllib.request
+import os
+
+# 1. Download model if missing
+model_path = 'pose_landmarker_lite.task'
+if not os.path.exists(model_path):
+    print("Downloading pose landmarker model...")
+    url = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    urllib.request.urlretrieve(url, model_path)
+
+# 2. Configure detector with strict confidence limits
+base_options = python.BaseOptions(model_asset_path=model_path)
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    running_mode=vision.RunningMode.IMAGE,
+    num_poses=1,
+    min_pose_detection_confidence=0.65,
+    min_pose_presence_confidence=0.65
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+POSE_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10),
+    (11, 12), (11, 23), (12, 24), (23, 24),
+    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    (23, 25), (25, 27), (27, 29), (27, 31), (29, 31),
+    (24, 26), (26, 28), (28, 30), (28, 32), (30, 32)
+]
+
+# Temporal Smoothing Cache
+prev_pts = {}
+ALPHA = 0.25  # Smoothing factor
+BORDER_MARGIN = 15  # Pixels from screen edge to consider 'out of frame'
+
+def is_within_frame(x, y, width, height, margin=15):
+    """Checks if a point is safely inside the frame boundaries."""
+    return margin <= x <= (width - margin) and margin <= y <= (height - margin)
+
+cap = cv2.VideoCapture(1)
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
+        print("Camera frame unavailable at index 1.")
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+
+    detection_result = detector.detect(mp_image)
+
+    curr_pts = {}
+    if detection_result.pose_landmarks and len(detection_result.pose_landmarks) > 0:
+        lms = detection_result.pose_landmarks[0]
+        
+        for idx, lm in enumerate(lms):
+            # Check visibility & presence properties
+            vis = getattr(lm, "visibility", 1.0)
+            pres = getattr(lm, "presence", 1.0)
+
+            # Drop landmarks with low confidence
+            if vis is not None and vis < 0.65:
+                continue
+            if pres is not None and pres < 0.65:
+                continue
+
+            raw_x, raw_y = int(lm.x * w), int(lm.y * h)
+
+            # Drop landmarks that touch or exceed the screen edges
+            if not is_within_frame(raw_x, raw_y, w, h, BORDER_MARGIN):
+                continue
+
+            # Apply EMA temporal smoothing
+            if idx in prev_pts:
+                smooth_x = int(ALPHA * raw_x + (1 - ALPHA) * prev_pts[idx][0])
+                smooth_y = int(ALPHA * raw_y + (1 - ALPHA) * prev_pts[idx][1])
+                curr_pts[idx] = (smooth_x, smooth_y)
+            else:
+                curr_pts[idx] = (raw_x, raw_y)
+
+        prev_pts = curr_pts
+
+        # Draw Skeleton Lines (Only when BOTH connected joints are valid and in frame)
+        for start_idx, end_idx in POSE_CONNECTIONS:
+            if start_idx in curr_pts and end_idx in curr_pts:
+                cv2.line(frame, curr_pts[start_idx], curr_pts[end_idx], (0, 255, 0), 2)
+
+        # Draw Valid Keypoints
+        for idx, pt in curr_pts.items():
+            if idx in [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]:
+                cv2.circle(frame, pt, 6, (255, 255, 0), -1)
+            else:
+                cv2.circle(frame, pt, 4, (0, 0, 255), -1)
+
+        # Draw Dynamic Bounding Box around ONLY currently visible parts
+        all_x = [p[0] for p in curr_pts.values()]
+        all_y = [p[1] for p in curr_pts.values()]
+        if len(all_x) >= 4:  # Require at least 4 valid joints
+            pad = 20
+            x1, y1 = max(0, min(all_x) - pad), max(0, min(all_y) - pad)
+            x2, y2 = min(w, max(all_x) + pad), min(h, max(all_y) + pad)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                frame, 
+                "Body Tracked", 
+                (x1, max(25, y1 - 10)), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.7, 
+                (0, 255, 0), 
+                2
+            )
+    else:
+        prev_pts = {}
+
+    cv2.imshow("Full Body Tracking (Out-of-Frame Filtered)", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
